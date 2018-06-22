@@ -1,0 +1,27 @@
+---
+#18517: v0.13 (Debian 7 (Wheezy)) does not support purge / backupretention
+
+- name: "Ensure mylvmbackup is not installed as package"
+  apt: pkg=mylvmbackup state=absent
+
+- name: "Ensure perl packages are installed"
+  apt: pkg={{ item }} state=present
+  with_items:
+    - libconfig-inifiles-perl
+    - libmime-lite-perl
+    - libtimedate-perl
+    - libfile-copy-recursive-perl
+
+- file: path=/var/cache/mylvmbackup/mnt state=directory
+
+- copy: src=mylvmbackup/mylvmbackup dest=/usr/local/bin/ mode=0755
+- copy: src=mylvmbackup/hooks/{{ item }} dest=/usr/local/share/mylvmbackup/
+  with_items:
+    - preflush.pm
+    - backupfailure.pm
+    - logerr.pm
+- copy: src=mylvmbackup/man/mylvmbackup.1 dest=/usr/local/man/man1/
+
+- name: Copy mylvmbackup.conf
+  copy: src=mylvmbackup.conf dest=/etc/ mode=0600 force=no
+

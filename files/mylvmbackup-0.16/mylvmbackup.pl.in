@@ -1,0 +1,1268 @@
+#!@PERL@  -w
+#
+# mylvmbackup - utility for creating MySQL backups via LVM snapshots
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+
+package mylvmbackup;
+use Config::IniFiles;
+use Date::Format;
+use DBD::mysql;
+use DBI;
+use File::Basename;
+use File::Copy;
+use File::Copy::Recursive qw/ rcopy /;
+use File::Path;
+use File::Temp qw/ mkstemps mktemp /;
+use Getopt::Long;
+use Sys::Hostname;
+use Fcntl;
+
+use diagnostics;
+use strict;
+
+# Version is set from the Makefile
+my $version='@VERSION@';
+my $build_date='@BUILDDATE@';
+
+# syslog-related options
+my $syslog_ident = 'mylvmbackup';
+my $syslog_args = 'pid,ndelay';
+my $action = "backup";
+my $configfile = "/etc/mylvmbackup.conf";
+my $configfile2 = "";
+
+my $TMP= ($ENV{TMPDIR} || "/tmp");
+
+my $backupdir;
+my $backuplv;
+my $datefmt;
+my $hooksdir;
+my $host;
+my $innodb_recover;
+my $recoveryopts;
+my $skip_flush_tables;
+my $skip_hooks;
+my $skip_mycnf;
+my $errorstate;
+my $extra_flush_tables;
+my $keep_snapshot;
+my $keep_mount;
+my $lvcreate;
+my $lvname;
+my $lvremove;
+my $lvs;
+my $lvsize;
+my $mount;
+my $mysqld_safe;
+my $mycnf;
+my $mountdir;
+my $need_xfsworkaround;
+my $password;
+my $pidfile;
+my $port;
+my $quiet;
+my $backuptype;
+my $backupretention;
+my $prefix;
+my $suffix;
+my $relpath;
+my $socket;
+my $rsync;
+my $rsnap;
+my $rsyncarg;
+my $rsnaparg;
+my $rsnaprsyncarg;
+my $tar;
+my $tararg;
+my $tarsuffixarg;
+my $tarfilesuffix;
+my $compress;
+my $compressarg;
+my $umount;
+my $user;
+my $vgname;
+my $log_method;
+my $syslog_socktype;
+my $syslog_facility;
+my $syslog_remotehost;
+my $mail_report_on;
+my $mail_buffer;
+my $mail_from;
+my $mail_to;
+my $mail_subject;
+my $snmp_report_on;
+my $snmp_base_oid;
+my $snmp_targets;
+my $snmp_community;
+my $snmp_port;
+my $use_thin_snapshots;
+my $zbackup;
+my $zbackuparg;
+
+# Load defaults into variables
+load_defaults();
+
+# Initialize variables from config file, if it exists
+if (-r $configfile) {
+  load_config($configfile);
+}
+
+# Load the commandline arguments
+load_args();
+
+# If they specified an alternative config file
+if ($configfile2 ne "") {
+  die ("Unable to load specified config file: $!\n") unless (-r $configfile2);
+  load_config($configfile2);
+  # re-load the arguments, as they should override any config file settings
+  load_args();
+}
+
+if (($log_method eq "syslog") or ($log_method eq "both")) {
+  use Sys::Syslog qw(:DEFAULT setlogsock :macros);
+  if ($syslog_socktype ne "native") {
+    die ("You need to provide syslog_remotehost!\n") unless ($syslog_remotehost);
+    setlogsock ($syslog_socktype);
+    $Sys::Syslog::host = $syslog_remotehost;
+  }
+  openlog ($syslog_ident, $syslog_args, $syslog_facility);
+  log_msg ("Starting new backup...", LOG_INFO);
+}
+
+if ($mail_report_on ne "never") {
+  eval 'use MIME::Lite;';
+  die ("You need to have MIME::Lite installed when enabling the mail report feature!\n") if $@;
+}
+
+if ($snmp_report_on ne "never") {
+  eval 'use Net::SNMP qw(:ALL);';
+  die ("You need to have Net::SNMP installed when enabling the SNMP report feature!\n") if $@;
+}
+
+if (lvm_version() =~ /^1/)
+{
+  log_msg("Linux LVM Version 2 or higher is required to run mylvmbackup.", LOG_ERR); 
+  exit(1);
+}
+
+# Clean up directory inputs
+$mountdir = clean_dirname($mountdir);
+$backupdir = clean_dirname($backupdir);
+
+# Validate the existence of a prefix
+if ($prefix eq "")
+{
+  log_msg("You must specify a non-empty prefix to name your backup!", LOG_ERR); 
+  exit(1);
+}
+
+if (length($backuplv) == 0)
+{
+  $backuplv = $lvname.'_snapshot';
+} else {
+  $backuplv = time2str($backuplv, time);
+}
+
+if (-e "/dev/$vgname/$backuplv" and $action eq "backup") {
+  log_msg("Snapshot volume $backuplv already exists!", LOG_ERR); 
+  exit(1);
+}
+
+if (not -e $mycnf and $skip_mycnf == 0 and $action eq "backup") {
+  log_msg("$mycnf does not exist!", LOG_ERR); 
+  exit(1);
+}
+
+my $date = time2str($datefmt, time);
+my $fullprefix = $prefix.'-'.$date.$suffix;
+
+my $topmountdir = $mountdir;
+
+# No .tar.gz on the end!
+my $archivename  = $backupdir.'/'.$fullprefix;
+
+my $mounted = 0;
+my $snapshot_created = 0;
+
+# Check for the backupdir, it must exist, and it must be readable/writable
+# Except when not doing any backups or using rsync to a remote server
+# If zbackup is the selected backup type, check if a backup repository
+# has already been created and set it up, if necessary
+unless (($backuptype eq 'none') or ($backuptype eq 'rsync' and $backupdir =~ /^[^\/].*:.*/))
+{
+  check_dir($backupdir, 'backupdir');
+  # Check for and initialize zbackup repository
+  if ($backuptype eq 'zbackup') { check_zbackuprepo($backupdir) };
+}
+  
+# Backup
+my ($cnfdir, $posmountdir, $pos_filename, $pos_tempfile_fh, $pos_tempfile, $mycnf_filename, @mountdir_content, $dsn, $dbh, $backupsuccess);
+
+if ($action eq "backup")
+{
+  # Check the mountdir, it must exist, and be readable/writeable
+  check_dir($mountdir, 'mountdir');
+  
+  # Append the prefix to the mountdir, to allow multiple parallel backups. The
+  # extra / is to ensure we go a level under it. An empty prefix is disallowed.
+  $mountdir .= '/'.$prefix;
+  
+  # Notice that we do not add a slash.
+  $posmountdir = $mountdir.'-pos';
+  $cnfdir = $mountdir.'-cnf-'.$date.$suffix;
+  
+  $pos_filename = $posmountdir.'/'.$fullprefix.'.pos';
+  ($pos_tempfile_fh, $pos_tempfile) = mkstemps($TMP.'/mylvmbackup-'.$fullprefix.'-XXXXXX', '.pos')
+    or log_msg ("Cannot create temporary file $pos_tempfile: $!", LOG_ERR);
+  
+  $mycnf_filename = $cnfdir.'/'.File::Basename::basename($mycnf);
+
+  
+  # Now create it
+  mkdir $mountdir;
+  mkdir $posmountdir;
+  mkdir $cnfdir;
+  
+  # Check it again for existence and read/write.
+  check_dir($mountdir, 'mountdir');
+  
+  # Now make sure it's empty
+  @mountdir_content = glob "$mountdir/*" ;
+  unless ( scalar(@mountdir_content) eq 0)
+  {
+  	log_msg ("Please make sure Temp dir ($mountdir) is empty.", LOG_ERR); 
+  	exit(1);
+  };
+  
+  # Figure out our DSN string
+  $dsn = "DBI:mysql:database=mysql;mysql_read_default_group=client";
+  
+  if(length($socket) > 0) {
+   $dsn .= ";mysql_socket=".$socket;
+  }
+  if(length($host) > 0) {
+   $dsn .= ";host=".$host;
+  }
+  if(length($port) > 0) {
+   $dsn .= ";port=".$port;
+  }
+  
+  run_hook ("preconnect");
+  log_msg ("Connecting to database...", LOG_INFO);
+  $dbh= DBI->connect($dsn,$user,$password);
+  if (!$dbh)
+  {
+    log_msg ($DBI::errstr, LOG_ERR);
+    die $DBI::errstr;
+  }
+  
+  # Fix to close mysql socket at close (needs DBD::mysql 4.019 or higher)
+  my $mysql_fh;
+  if ($DBD::mysql::VERSION >= 4.019) {
+    open($mysql_fh, '<&=', $dbh->mysql_fd) or die "dup: $!";
+    fcntl($mysql_fh, F_SETFD, FD_CLOEXEC);
+  }
+  
+  run_hook ("preflush");
+  flush_tables($dbh) unless ($skip_flush_tables == 1);
+  
+  create_posfile($dbh);
+  
+  run_hook ("presnapshot");
+  $snapshot_created= create_lvm_snapshot();
+  
+  run_hook ("preunlock");
+  unlock_tables($dbh);
+  
+  run_hook ("predisconnect");
+  log_msg ("Disconnecting from database...", LOG_INFO);
+  $dbh->disconnect;
+  
+  if ($snapshot_created)
+  {
+    run_hook("premount");
+    $mounted= mount_snapshot();
+    save_posfile();
+    if ($mounted)
+    {
+      if ($innodb_recover == 1)
+      {
+        do_innodb_recover();
+      }
+      if ($skip_mycnf == 0)
+      {
+        copy_mycnf();
+      }
+  
+      run_hook("prebackup");
+      $backupsuccess=0;
+      if ($backuptype eq 'tar') {$backupsuccess = do_backup_tar()}
+      elsif ($backuptype eq 'rsync') {$backupsuccess = do_backup_rsync()}
+      elsif ($backuptype eq 'rsnap') {$backupsuccess = do_backup_rsnap()}
+      elsif ($backuptype eq 'zbackup') {$backupsuccess = do_backup_zbackup()}
+      else {$backupsuccess = do_backup_none()};
+  
+      if ($backupsuccess == 1)
+      {
+        run_hook("backupsuccess");
+      } else {
+        run_hook("backupfailure");
+        log_msg ("Backup creation failed", LOG_ERR);
+        cleanup();
+        exit 1;
+      }
+    } else {
+      log_msg ("Could not mount snapshot volume $backuplv to $mountdir", LOG_ERR);
+      cleanup();
+      exit 1;
+    }
+  } else {
+    log_msg ("Could not create snapshot volume $backuplv", LOG_ERR);
+    cleanup();
+    exit 1;
+  }
+  
+  cleanup();
+  exit 0;
+}
+
+# Only purge local tar or rsync backups
+if  (($action eq "purge")
+and ( $backuptype eq 'tar'
+or  ( $backuptype eq 'rsync' and $backupdir =~ /^\/.*/ ) )
+and ($backupretention > 0))
+{
+  my @existingbackups;
+  my %files;
+
+  # Gather list of files and time stamps (mtime), exclude dot files
+  opendir(my $DH, $backupdir) or die "Error opening $backupdir: $!";
+  %files = map { $_ => (stat("$backupdir/$_"))[9] } grep(! /^\./, readdir($DH));
+  closedir($DH);
+
+  # Sort by mtime
+  @existingbackups = sort { $files{$b} <=> $files{$a} } (keys %files);
+
+  if ($#existingbackups+1 <= $backupretention) {
+    log_msg ("Retention is $backupretention, no backup to remove.", LOG_INFO);
+  } else {
+    while ($#existingbackups+1 > $backupretention) {
+      my $item = pop @existingbackups;
+      log_msg ("Removing old backup $backupdir/$item", LOG_INFO);
+      (unlink "$backupdir/$item" or log_msg ("Error while removing old backup file $backupdir/$item: $!", LOG_ERR)) if -f "$backupdir/$item";
+      (rmtree "$backupdir/$item" or log_msg ("Error while removing old backup directory $backupdir/$item: $!", LOG_ERR)) if -d "$backupdir/$item";
+    }
+  }
+  exit 0;
+} else {
+  log_msg ("Retention is disabled or backup type provides no backups to remove.", LOG_INFO);
+  exit 0;
+}
+
+log_msg ("Unknown action: $action", LOG_ERR);
+exit 1;
+
+# Please keep all 3 functions in the same order: load_config, load_args, load_defaults
+sub load_config 
+{
+  my $configfile = shift(@_);
+  my $cfg = new Config::IniFiles( -file => $configfile )
+    or log_msg ("Couldn't read configuration file: " . $!, 'LOG_WARNING');
+
+  $user = $cfg->val( 'mysql', 'user', $user);
+  $password = $cfg->val ('mysql', 'password', $password);
+  $host = $cfg->val ('mysql', 'host', $host);
+  $port = $cfg->val ('mysql', 'port', $port);
+  $socket = $cfg->val ('mysql', 'socket', $socket);
+  $mysqld_safe = $cfg->val ('mysql', 'mysqld_safe', $mysqld_safe);
+  $mycnf = $cfg->val ('mysql', 'mycnf', $mycnf);
+
+  $vgname=$cfg->val ('lvm', 'vgname', $vgname);
+  $lvname=$cfg->val ('lvm', 'lvname', $lvname);
+  $lvsize=$cfg->val ('lvm', 'lvsize', $lvsize);
+  $backuplv = $cfg->val ('lvm', 'backuplv', $backuplv);
+  
+  $backuptype=$cfg->val ('misc', 'backuptype', $backuptype);
+  $backupretention=$cfg->val ('misc', 'backupretention', $backupretention);
+  $prefix=$cfg->val ('misc', 'prefix', $prefix);
+  $suffix=$cfg->val ('misc', 'suffix', $suffix);
+  $datefmt=$cfg->val ('misc', 'datefmt', $datefmt);
+  $innodb_recover=$cfg->val ('misc', 'innodb_recover', $innodb_recover);
+  $recoveryopts=$cfg->val ('misc', 'recoveryopts', $recoveryopts);
+  $pidfile=$cfg->val ('misc', 'pidfile', $pidfile);
+  $skip_flush_tables=$cfg->val ('misc', 'skip_flush_tables', $skip_flush_tables);
+  $extra_flush_tables=$cfg->val ('misc', 'extra_flush_tables', $extra_flush_tables);
+  $skip_mycnf=$cfg->val ('misc', 'skip_mycnf', $skip_mycnf);
+  $rsyncarg=$cfg->val ('misc', 'rsyncarg', $rsyncarg);
+  $rsnaparg=$cfg->val ('misc', 'rsnaparg', $rsnaparg);
+  $rsnaprsyncarg=$cfg->val ('misc', 'rsnaprsyncarg', $rsnaprsyncarg);
+  $tararg=$cfg->val ('misc', 'tararg', $tararg);
+  $tarsuffixarg=$cfg->val ('misc', 'tarsuffixarg', $tarsuffixarg);
+  $tarfilesuffix = $cfg->val ('misc', 'tarfilesuffix', $tarfilesuffix);
+  $compressarg=$cfg->val ('misc', 'compressarg', $compressarg);
+  $hooksdir = $cfg->val ('misc', 'hooksdir', $hooksdir);
+  $skip_hooks=$cfg->val ('misc', 'skip_hooks', $skip_hooks);
+  $keep_snapshot=$cfg->val ('misc', 'keep_snapshot', $keep_snapshot);
+  $keep_mount=$cfg->val ('misc', 'keep_mount', $keep_mount);
+  $quiet=$cfg->val ('misc', 'quiet', $quiet);
+  $use_thin_snapshots=$cfg->val ('misc', 'thin', $use_thin_snapshots);
+
+  $mountdir=$cfg->val ('fs', 'mountdir', $mountdir);
+  $backupdir=$cfg->val ('fs', 'backupdir', $backupdir);
+  $relpath=$cfg->val ('fs', 'relpath', $relpath);
+  $need_xfsworkaround=$cfg->val ('fs', 'xfs', $need_xfsworkaround);
+
+  $lvcreate=$cfg->val ('tools', 'lvcreate', $lvcreate);
+  $lvremove=$cfg->val ('tools', 'lvremove', $lvremove);
+  $lvs=$cfg->val ('tools', 'lvs', $lvs);
+  $mount=$cfg->val ('tools', 'mount', $mount);
+  $umount=$cfg->val ('tools', 'umount', $umount);
+  $tar=$cfg->val ('tools', 'tar', $tar);
+  $compress=$cfg->val ('tools', 'compress', $compress);
+  $rsync=$cfg->val ('tools', 'rsync', $rsync);
+  $rsnap=$cfg->val ('tools', 'rsnap', $rsnap);
+
+  $log_method = $cfg->val('logging', 'log_method', $log_method);
+  $syslog_socktype = $cfg->val ('logging', 'syslog_socktype', $syslog_socktype);
+  $syslog_facility = $cfg->val ('logging', 'syslog_facility', $syslog_facility);
+  $syslog_remotehost = $cfg->val ('logging', 'syslog_remotehost', $syslog_remotehost);
+  $mail_report_on = $cfg->val ('reporting', 'mail_report_on', $mail_report_on);
+  $mail_from = $cfg->val ('reporting', 'mail_from', $mail_from);
+  $mail_to = $cfg->val ('reporting', 'mail_to', $mail_to);
+  $mail_subject = $cfg->val ('reporting', 'mail_subject', $mail_subject);
+  $snmp_report_on = $cfg->val ('reporting', 'snmp_report_on', $snmp_report_on);
+  $snmp_base_oid = $cfg->val ('reporting', 'snmp_base_oid', $snmp_base_oid);
+  $snmp_targets = $cfg->val ('reporting', 'snmp_targets', $snmp_targets);
+  $snmp_community = $cfg->val ('reporting', 'snmp_community', $snmp_community);
+  $snmp_port = $cfg->val ('reporting', 'snmp_port', $snmp_port);
+
+  $zbackup= $cfg->val ('zbackup', 'zbackup', $zbackup);
+  $zbackuparg= $cfg->val ('zbackup', 'zbackuparg', $zbackuparg);
+}
+
+# Please keep all 3 functions in the same order: load_config, load_args, load_defaults 
+sub load_args
+{
+  GetOptions(
+# stuff that doesn't go in the config file ;-)
+    "help" => \&help,  
+    "configfile=s" => \$configfile2,
+    "action=s" => \$action,
+
+# mysql
+    "user=s" => \$user,
+    "password=s" => \$password,
+    "host=s" => \$host,
+    "port=i" => \$port,
+    "socket=s" => \$socket,
+    "mysqld_safe=s" => \$mysqld_safe,
+    "mycnf=s" => \$mycnf,
+
+# lvm    
+    "vgname=s" => \$vgname,
+    "lvname=s" => \$lvname,
+    "lvsize=s" => \$lvsize,
+    "backuplv=s" => \$backuplv,
+
+# zbackup
+    "zbackup=s" => \$zbackup,
+    "zbackuparg=s" => \$zbackuparg,
+
+# misc
+    "backuptype=s" => \$backuptype,
+    "backupretention=s" => \$backupretention,
+    "prefix=s" => \$prefix,
+    "suffix=s" => \$suffix,
+    "datefmt:s" => \$datefmt,
+    "innodb_recover" => \&innodb_recover,
+    "recoveryopts=s" => \$recoveryopts,
+    "pidfile=s" => \$pidfile,
+    "skip_flush_tables" => \&skip_flush_tables,
+    "extra_flush_tables" => \&extra_flush_tables,
+    "skip_mycnf" => \&skip_mycnf,
+    "tararg=s" => \$tararg,
+    "tarsuffixarg=s" => \$tarsuffixarg,
+    "tarfilesuffix=s" => \$tarfilesuffix,
+    "compressarg=s" => \$compressarg,
+    "rsyncarg=s" => \$rsyncarg,
+    "rsnaparg=s" => \$rsnaparg,
+    "rsnaprsyncarg=s" => \$rsnaprsyncarg,
+    "hooksdir=s" => \$hooksdir,
+    "skip_hooks" => \&skip_hooks,
+    "keep_snapshot" => \&keep_snapshot,
+    "keep_mount" => \&keep_mount,
+    "thin" => \&use_thin_snapshots,
+    "quiet" => \&quiet,
+
+# fs
+    "mountdir=s" => \$mountdir,
+    "backupdir=s" => \$backupdir,
+    "relpath=s" => \$relpath,
+    "xfs" => \&need_xfsworkaround,
+
+# tools
+    "lvcreate=s" => \$lvcreate,
+    "lvremove=s" => \$lvremove,
+    "lvs=s" => \$lvs,
+    "mount=s" => \$mount,
+    "umount=s" => \$umount,
+    "tar=s" => \$tar,
+    "compress=s" => \$compress,
+    "rsync=s" => \$rsync,
+    "rsnap=s" => \$rsnap,
+
+# logging
+    "log_method=s" => \$log_method,
+    "syslog_socktype=s" => \$syslog_socktype,
+    "syslog_facility=s" => \$syslog_facility,
+    "syslog_remotehost=s" => \$syslog_remotehost,
+    "mail_report_on" => \&mail_report_on,
+    "mail_from=s" => \$mail_from,
+    "mail_to=s" => \$mail_to,
+    "mail_subject=s" => \$mail_subject,
+    "snmp_report_on" => \&snmp_report_on,
+    "snmp_base_oid=s" => \&snmp_base_oid,
+    "snmp_targets=s" => \&snmp_targets,
+    "snmp_community=s" => \&snmp_community,
+    "snmp_port=i" => \&snmp_port,
+  ) or help();
+
+  die help() unless $action eq "backup" or $action eq "purge";
+
+  # As this function is called last, append to @INC here.
+  eval "use lib '$hooksdir'";
+}
+
+# Please keep all 3 functions in the same order: load_config, load_args, load_defaults 
+sub load_defaults
+{
+# mysql
+  $user = 'root';
+  $password = '';
+  $host = '';
+  $port = '';
+  $socket = '';
+  $mysqld_safe='mysqld_safe';
+  $mycnf = '/etc/my.cnf';
+
+# lvm
+  $vgname='mysql';
+  $lvname='data';
+  $lvsize='5G';
+  $backuplv = '';
+
+# misc
+  $backuptype='tar';
+  $backupretention=0;
+  $prefix='backup';
+  $suffix='_mysql';
+  $datefmt='%Y%m%d_%H%M%S';
+  $innodb_recover=0;
+  $recoveryopts='--skip-networking --skip-grant --bootstrap --skip-syslog --skip-slave-start';
+  $pidfile = '$TMP/mylvmbackup_recoverserver.pid';
+  $skip_flush_tables=0;
+  $extra_flush_tables=0;
+  $skip_mycnf=0;
+  $tararg='cf';
+  $tarsuffixarg='';
+  $tarfilesuffix='.tar.gz';
+  $compressarg='--stdout --verbose --best';
+  $rsyncarg='-avPW';
+  $rsnaprsyncarg='';
+  $rsnaparg='7';
+  $hooksdir='/usr/share/mylvmbackup';
+  $skip_hooks=0;
+  $keep_snapshot=0;
+  $keep_mount=0;
+  $quiet=0;
+  $use_thin_snapshots=0;
+  $errorstate=0;
+
+# fs
+  $mountdir='/var/tmp/mylvmbackup/mnt/';
+  $backupdir='/var/tmp/mylvmbackup/backup/';
+  $relpath='';
+  $need_xfsworkaround=0;
+
+# External tools - make sure that these are in $PATH or provide absolute names
+  $lvcreate='lvcreate';
+  $lvremove='lvremove';
+  $lvs='lvs';
+  $mount='mount';
+  $umount='umount';
+  $tar='tar';
+  $compress='gzip';
+  $rsync='rsync';
+  $rsnap='rsnap';
+
+# logging
+  $log_method = 'console';
+  $syslog_socktype = 'native';
+  $syslog_facility = '';
+  $syslog_remotehost = '';
+
+# reporting
+  $mail_report_on = 'never';
+  $mail_from = 'root@localhost';
+  $mail_to = 'root@localhost';
+  $mail_subject = 'mylvmbackup report for localhost';
+  $snmp_report_on = 'never';
+  $snmp_base_oid = '1.1.1.1.1.1.1.1';
+  $snmp_targets = '127.0.0.1';
+  $snmp_community = 'public';
+  $snmp_port = '162';
+
+# zbackup
+  $zbackup='zbackup';
+  $zbackuparg='--non-encrypted';
+}
+
+sub flush_tables 
+{
+  my $dbh = shift;
+  if($extra_flush_tables == 1)
+  {
+    log_msg ("Flushing tables (initial)...", LOG_INFO);
+    $dbh->do("FLUSH TABLES") or log_msg ($DBI::errstr, LOG_ERR);
+  }
+
+  log_msg ("Flushing tables with read lock...", LOG_INFO);
+  $dbh->do("FLUSH TABLES WITH READ LOCK") or log_msg ($DBI::errstr, LOG_ERR);
+}
+
+sub unlock_tables {
+  my $dbh = shift;
+  log_msg ("Unlocking tables...", LOG_INFO);
+  $dbh->do("UNLOCK TABLES") or log_msg ($DBI::errstr, LOG_ERR);
+}
+
+sub create_posfile
+{
+  log_msg ("Taking position record into $pos_tempfile...", LOG_INFO);
+  my $dbh = shift;
+  _create_posfile_single($dbh, 'SHOW MASTER STATUS', $pos_tempfile_fh, 'Master');
+  _create_posfile_single($dbh, 'SHOW SLAVE STATUS', $pos_tempfile_fh, 'Slave');
+  close $pos_tempfile_fh or log_msg ("Closing $pos_tempfile failed: $!", LOG_ERR);
+}
+
+sub _create_posfile_single
+{
+	my $dbh = shift; my $query = shift; my $fh = shift; my $pos_prefix = shift;
+	my $sth = $dbh->prepare($query) or log_msg ($DBI::errstr, LOG_ERR);
+	$sth->execute or log_msg ($DBI::errstr, LOG_ERR);
+	while (my $r = $sth->fetchrow_hashref) {
+		foreach my $f (@{$sth->{NAME}}) {
+			my $v = $r->{$f};
+			$v = '' if (!defined($v));
+			my $line = "$pos_prefix:$f=$v\n";
+			print $fh $line or log_msg ("Writing position record failed: $!", LOG_ERR);
+		}
+ }
+ $sth->finish;
+}
+
+sub copy_mycnf
+{
+  log_msg ("Copying $mycnf to $cnfdir...", LOG_INFO);
+  unless (rcopy($mycnf, $cnfdir)) {
+    log_msg ("Could not copy $mycnf to $cnfdir: $!", LOG_ERR);
+    cleanup();
+    exit 1;
+  }
+}
+
+sub do_backup_tar
+{
+  my $tarball = $archivename.$tarfilesuffix;
+  my $tarballtmp = mktemp("$tarball.INCOMPLETE-XXXXXXX");
+  umask 077;
+
+  log_msg ("Taking actual backup...", LOG_INFO);
+  log_msg ("Creating tar archive $tarball", LOG_INFO);
+  my $mountdir_rel = $mountdir;
+  $mountdir_rel =~ s/^$topmountdir//g;
+  $mountdir_rel =~ s/^\/+//g;
+
+  $tararg = "v" . $tararg unless $quiet;
+  
+  # To be portable, do a "cd" before calling tar (ie. don't do "tar ... -C ...")
+  my $command= "cd '$topmountdir' ;";
+
+# Check if a compress program has been set.
+  # If NOT, then make tar write directly to $tarballtmp.
+  # Otherwise make tar pipe to stdout and pipe stdin to compress program.
+  
+  # Build the primary tar command.
+  $command.= sprintf("'%s' %s %s %s %s", 
+    $tar, $tararg,
+    # If the user does not want compression, directly write the tar
+    # file. Else write to "-", ie. stdout.
+    ($compress eq "") ? $tarballtmp : "-",
+    "$mountdir_rel/$relpath", $tarsuffixarg);
+  # Maybe some additional files are to be added
+  $command .= " " . File::Basename::basename($posmountdir);
+  $command .= " " . File::Basename::basename($cnfdir) if ($skip_mycnf==0);
+  # If the stuff should be compressed (ie. a compress program has been set),
+  # then the stream has to be piped to the $compress program.
+  $command .= "| $compress $compressarg -> $tarballtmp" unless ($compress eq "");
+  if (run_command("create tar archive", $command))
+  {
+    rename $tarballtmp, $tarball;
+    return 1;
+  } else {
+    return 0;
+  }    
+}
+
+sub do_backup_zbackup
+{
+  umask 077;
+
+  log_msg ("Taking actual backup...", LOG_INFO);
+  log_msg ("Creating zbackup archive $fullprefix", LOG_INFO);
+  my $mountdir_rel = $mountdir;
+  $mountdir_rel =~ s/^$topmountdir//g;
+  $mountdir_rel =~ s/^\/+//g;
+
+  # To be portable, do a "cd" before calling tar (ie. don't do "tar ... -C ...")
+  my $command= "cd '$topmountdir' ;";
+
+  # Build the primary tar command.
+  # We explicitly override $tararg to "cf" to prevent compression that bad for zbackup
+  $command.= sprintf("'%s' cf %s %s %s " ,
+    $tar, "-", "$mountdir_rel/$relpath", $tarsuffixarg );
+
+  # Maybe some additional files are to be added
+  $command .= " " . File::Basename::basename($posmountdir);
+  $command .= " " . File::Basename::basename($cnfdir) if ($skip_mycnf==0);
+
+  my $zarchivename = $backupdir . '/backups/' . $fullprefix;
+  $command .= sprintf("  | %s %s backup %s ", $zbackup , $zbackuparg, $zarchivename );
+
+  if (run_command("create zbackup archive", $command))
+  {
+    return 1;
+  } else {
+    return 0;
+  }
+}
+
+sub do_backup_none
+{
+  log_msg ("Backuptype none selected, not doing backup... DONE", LOG_INFO);
+  return 1;
+}
+
+sub do_backup_rsnap
+{
+  log_msg ("Archiving with rsnap to $backupdir", LOG_INFO);
+
+  # Trailing slash is bad
+  my $relpath_noslash = $relpath;
+  $relpath_noslash =~ s/\/+$//g;
+
+  my $command = "$rsnap $rsnaparg $mountdir/$relpath_noslash";
+  $command .= " $posmountdir";
+  $command .= " $cnfdir" if ($skip_mycnf==0);
+  $command .= " $backupdir/";
+  $command .= " -- $rsnaprsyncarg" unless ($rsnaprsyncarg eq "");
+
+  return run_command("create rsnap archive", $command);
+}
+
+sub do_backup_rsync
+{
+  my $destdir = $archivename;
+  # Do not use a temporary directory for remote backups
+  my $destdirtmp = $destdir;
+  unless ($destdir =~ /^[^\/].*:.*/) {
+    $destdirtmp = sprintf('%s.INCOMPLETE-%07d',$destdir,int(rand(2**16)));
+  }
+  log_msg ("Taking actual backup...", LOG_INFO);
+  log_msg ("Archiving with rsync to $destdir", LOG_INFO);
+
+  # Trailing slash is bad
+  my $relpath_noslash = $relpath;
+  $relpath_noslash =~ s/\/+$//g;
+
+  my $command = "$rsync $rsyncarg $mountdir/$relpath_noslash";
+  $command .= " $posmountdir";
+  $command .= " $cnfdir" if ($skip_mycnf==0);
+  $command .= " $destdirtmp/";
+  if (run_command("create rsync archive", $command))
+  {
+    rename $destdirtmp, $destdir if($destdirtmp ne $destdir);
+    return 1;
+  } else {
+    return 0;
+  }    
+}
+
+sub mount_snapshot
+{ 
+  log_msg ("Mounting snapshot...", LOG_INFO);
+  my $params= 'rw';
+
+  $params.= ',nouuid' if $need_xfsworkaround;
+  my $command= "$mount -o $params /dev/$vgname/$backuplv $mountdir";
+  return run_command("mount snapshot", $command);
+}
+
+sub do_innodb_recover
+{
+  log_msg ("Recovering InnoDB...", LOG_INFO);
+  my $command="echo 'select 1;' | $mysqld_safe --socket=$TMP/mylvmbackup.sock --pid-file=$pidfile --log-error=$TMP/mylvmbackup_recoverserver.err --datadir=$mountdir/$relpath $recoveryopts";
+  return run_command("InnoDB recovery on snapshot", $command);
+}
+
+sub save_posfile
+{
+  log_msg ("Copying $pos_tempfile to $pos_filename...", LOG_INFO);
+  copy($pos_tempfile, $pos_filename) or log_msg ("Could not copy $pos_tempfile to $pos_filename: $!", LOG_ERR);
+}
+
+sub create_lvm_snapshot 
+{ 
+  my $params = '';
+  $params = "--size=$lvsize" unless $use_thin_snapshots;
+  my $command= "$lvcreate -s $params --name=$backuplv /dev/$vgname/$lvname";
+  return run_command("taking LVM snapshot", $command);
+}
+
+sub log_msg
+{
+  my $msg = shift;
+  my $syslog_level = shift;
+
+  # Only log errors and warnings if quiet option is set
+  return if ($quiet) and ($syslog_level eq LOG_INFO);
+
+  if ($log_method eq "console") {
+    __print_it($syslog_level, $msg);
+  } elsif ($log_method eq "syslog") {
+    __log_it ($syslog_level, $msg);
+  } elsif ($log_method eq "both") {
+    __print_it ($syslog_level, $msg);
+    __log_it ($syslog_level, $msg);
+  }
+
+  if ($syslog_level eq LOG_ERR)
+  {
+    $errorstate = 1;
+    run_hook ("logerr", $msg);
+  }
+
+  unless ($mail_report_on eq "never") {
+    __mail_it ($syslog_level, $msg);
+  }
+
+  sub __print_it
+  {
+    my $syslog_level = shift;
+    my $msg = shift;
+    my $logmsg = '';
+
+    if ($syslog_level eq LOG_WARNING) {
+      $logmsg = " Warning: ";
+    } elsif ($syslog_level eq LOG_INFO) {
+      $logmsg = " Info: ";
+    } elsif ($syslog_level eq LOG_ERR) {
+      $logmsg = " Error: ";
+    }
+    print timestamp() . $logmsg . $msg . "\n";
+  }
+
+  sub __mail_it
+  {
+    my $syslog_level = shift;
+    my $msg = shift;
+    my $logmsg = '';
+
+    if ($syslog_level eq LOG_WARNING) {
+      $logmsg = " Warning: ";
+    } elsif ($syslog_level eq LOG_INFO) {
+      $logmsg = " Info: ";
+    } elsif ($syslog_level eq LOG_ERR) {
+      $logmsg = " Error: ";
+    }
+
+    $mail_buffer .= timestamp() . $logmsg . $msg . "\n";
+  }
+
+  sub __log_it { syslog ($_[0], $_[1]); }
+
+  sub timestamp { return ymd() . " " . hms(); }
+
+  sub hms
+  {
+    my ($sec,$min,$hour,$mday,$mon,$year) = localtime();
+    return sprintf("%02d:%02d:%02d", $hour, $min, $sec);
+  }
+
+  sub ymd
+  {
+    my ($sec,$min,$hour,$mday,$mon,$year) = localtime();
+    return sprintf("%04d%02d%02d", $year+1900, $mon+1, $mday);
+  }
+}
+
+#
+# Unmount file systems, clean up temp files and discard the snapshot (if
+# required)
+#
+sub cleanup
+{
+  run_hook("precleanup");
+  log_msg ("Cleaning up...", LOG_INFO);
+  unlink $pos_tempfile if (-f $pos_tempfile);
+  rmtree($posmountdir) if (-d $posmountdir);
+  rmtree($cnfdir) if (-d $cnfdir);
+  unless ($keep_mount) {
+    run_command("Unmounting $mountdir","$umount $mountdir") if ($mounted);
+    rmtree($mountdir) if (-d $mountdir);
+  } else {
+    log_msg("Not removing mount as requested by configuration", LOG_INFO);
+  }
+  if (-e "/dev/$vgname/$backuplv") {
+    my @lvs_info = `$lvs /dev/$vgname/$backuplv`;
+    chomp (@lvs_info);
+    log_msg ("LVM Usage stats:", LOG_INFO);
+    foreach my $lvs_info (@lvs_info) {
+        log_msg ($lvs_info, LOG_INFO);
+    }
+  }
+  if ($snapshot_created)
+  {
+    unless ($keep_snapshot || $keep_mount) {
+      run_command("Removing snapshot", "$lvremove -f /dev/$vgname/$backuplv");
+    } else {
+      log_msg("Not removing snapshot as requested by configuration", LOG_INFO);
+    }
+  }
+}
+
+sub innodb_recover {
+	$innodb_recover = 1;
+}
+
+sub skip_flush_tables {
+  $skip_flush_tables = 1;
+}
+
+sub extra_flush_tables {
+  $extra_flush_tables = 1;
+}
+
+sub skip_hooks {
+  $skip_hooks = 1;
+}
+
+sub keep_snapshot {
+  $keep_snapshot = 1;
+}
+
+sub keep_mount {
+  $keep_mount = 1;
+}
+
+sub use_thin_snapshots {
+  $use_thin_snapshots = 1;
+}
+
+sub quiet {
+  $quiet = 1;
+}
+
+sub skip_mycnf {
+  $skip_mycnf = 1;
+}
+
+sub need_xfsworkaround {
+	$need_xfsworkaround = 1;
+}
+
+sub help {
+# No need to send an email when printing the help output (BUG#1351000)
+$mail_report_on = 'never';
+$snmp_report_on = 'never';
+print <<EOF;
+
+mylvmbackup Version $version ($build_date)
+ 
+This script performs a MySQL backup by using an LVM snapshot volume.
+It requires the MySQL server's data directory to be placed on a logical
+volume, and creates an LVM snapshot to create a copy of the MySQL datadir.
+Afterwards, all data files are archived to a backup directory.
+
+See the manual page for more info including a complete list of options and
+check the home page at http://www.lenzg.net/mylvmbackup for more info.
+ 
+Common options:
+
+  --user=<username>             MySQL username (def: $user)
+  --password=<password>         MySQL password
+  --host=<host>                 Hostname for MySQL
+  --port=<port>                 TCP port for MySQL
+  --socket=<socket>             UNIX socket for MySQL
+  --action=backup|purge         Action to run (def: backup)
+  --quiet                       Suppress diagnostic output, print warnings
+                                and errors only
+
+  --vgname=<name>               VG containing datadir (def: $vgname)
+  --lvname=<name>               LV containing datadir (def: $lvname)
+  --relpath=<name>              Relative path on LV to datadir (def: $relpath)
+  --lvsize=<size>               Size for snapshot volume (def: $lvsize)
+
+  --prefix=<prefix>             Prefix for naming the backup (def: $prefix)
+  --suffix=<suffix>             Suffix for naming the backup (def: $suffix)
+  --backupdir=<dirname>         Path for archives (def: $backupdir)
+  --backuptype=<type>           Select backup type: none, rsnap, rsync, tar
+                                or zbackup (def: $backuptype)
+
+  --configfile=<file>           Specify an alternative configuration file
+                                (def: $configfile)
+  --help                        Print this help
+
+If your MySQL daemon is not listening on localhost, or using the default 
+socket location, you must specify --host or --socket.
+
+EOF
+ exit 1;
+}
+
+#
+# Check if given directory is a zbackup repo
+#
+sub check_zbackuprepo
+{
+ my ($dirname) = @_;
+ if (!(-d $dirname . '/backups') or !(-d $dirname . '/bundles') or !(-d $dirname . '/index') or !(-f $dirname . '/info') ) {
+    eval {
+      my $command= "$zbackup $zbackuparg init $dirname";
+      run_command("Initializing zbackup repository", $command);
+    };
+    if($@) {
+      log_msg ("The directory $dirname is not a zbackup repository and I was unable to initialize it.", LOG_ERR);
+      exit 1;
+    }
+ }
+
+ unless ( (-d $dirname . '/backups') and (-d $dirname . '/bundles') and (-d $dirname . '/index') and (-f $dirname . '/info') )
+ {
+   print <<DIRERROR;
+
+The directory $dirname not a zbackup repository and I don't have 
+sufficient privileges to initalize it.
+Please verify the permissions or provide another directory
+by using the option --backupdir=<directory>
+
+DIRERROR
+
+   log_msg ("The directory $dirname is not a zbackup repo and I don't have sufficient privileges to initialize it.", LOG_ERR);
+  }
+}
+
+#
+# Check if given directory exists and is writable
+#
+sub check_dir 
+{
+ my ($dirname,$optioname) = @_;
+ if (!(-d $dirname)) {
+    eval { File::Path::mkpath($dirname) };
+    if($@) {
+      log_msg ("The directory $dirname does not exist and I was unable to create it.", LOG_ERR);
+      exit 1;
+    }
+ }
+ unless ( (-d $dirname) and 
+     (-w $dirname) and (-r $dirname) and  (-x $dirname))
+ {
+   print <<DIRERROR;
+
+The directory $dirname does not exist or I don't have 
+sufficient privileges to read/write/access it.
+Please verify the permissions or provide another directory 
+by using the option --$optioname=<directory>
+
+DIRERROR
+
+   log_msg ("The directory $dirname does not exist or I don't have sufficient privileges to read/write/access it.", LOG_ERR);
+  }
+}  
+
+#
+# Sanitize directory names:
+#
+# 1. Remove any whitespace padding first
+# 2. Remove trailing slashes
+#
+sub clean_dirname
+{
+ my ($d) = @_;
+ $d = time2str($d, time) if($d =~ /(%[YmdhHMS])+/);
+ $d =~ s/^\s*//g;
+ $d =~ s/\s$//g;
+ return File::Basename::dirname($d.'/foo')
+}
+
+#
+# Run system command
+#
+sub run_command
+{
+  my ($message) = shift;
+
+  log_msg("Running: " . join(" ", @_), LOG_INFO);
+
+  if (system(@_) == 0 && $? == 0)
+  {
+    log_msg("DONE: $message", LOG_INFO);
+    return 1;
+  } else {
+    my $err;
+    if ($? & 0xff)
+    {
+      $err = "received signal " . ($? & 0xff);
+    } elsif ($? >> 8) {
+      $err = "exit status " . ($? >> 8);
+    } else {
+      $err = $!;
+    }
+    log_msg("FAILED: $message ($err)", LOG_ERR);
+  }
+  return 0;
+}
+
+#
+# Script hooks
+#
+sub run_hook
+{
+  return if $skip_hooks;
+  my ($hookname, $hookarg) = @_;
+  my $hookfile = $hooksdir."/".$hookname;
+  $hookarg="" unless ($hookarg);
+
+  eval "use $hookname";
+  if($@)
+  {
+    # couldn't find hook as perl module. see if it's a shell script.
+    if (-x $hookfile)
+    {
+      my $message="Running hook '$hookname'";
+      $message.=" with argument '$hookarg'" unless ($hookarg eq "");
+      log_msg ($message, LOG_INFO);
+      system($hookfile $hookarg);
+      if ( $? >> 8 != 0)
+      {
+        log_msg (sprintf("Hook $hookname failed with nonzero exit value %d", $? >> 8),
+               $hookname eq "precleanup" ? LOG_WARNING : LOG_ERR);
+      }
+    }
+  } else {
+    log_msg ("Running hook '$hookname' as perl module.", LOG_INFO);
+    my $ret = $hookname->execute(($dbh ? $dbh->clone() : undef), $hookarg);
+    if(!$ret)
+    {
+      log_msg ("Perl module '$hookname' did not return a true result: " . $hookname->errmsg(), LOG_ERR);
+    }
+  }
+}
+
+sub lvm_version
+{
+  my $lv = `$lvs --version`;
+
+  log_msg("$lvs: $!", LOG_ERR) if $? != 0;
+
+  $lv =~ s/LVM version: //;
+  $lv =~ s/^\s*//;
+  $lv =~ s/\s.+//g;
+
+  return $lv;
+}
+
+sub snmp_update
+{
+   my $message = shift;
+   my $level   = shift;
+   my @targets = split(/,/, $snmp_targets);
+
+   foreach my $target (@targets) {
+       my ($session, $error) = Net::SNMP->session(
+           -hostname  => $target,
+           -community => $snmp_community,
+           -port      => $snmp_port,
+           -version   => 'snmpv2c'
+       );
+
+       if (!defined($session)) {
+           printf("ERROR: %s.\n", $error);
+           exit 1;
+       }
+
+       # TIMETICKS: 0x43
+       # OBJECT_IDENTIFIER: 0x06
+       # OCTET_STRING: 0x04
+
+       my $result = $session->snmpv2_trap(
+           -varbindlist => [ '1.3.6.1.2.1.1.3.0', 0x43, 600, '1.3.6.1.6.3.1.1.4.1.0', 0x06, "$snmp_base_oid.$level", "$snmp_base_oid.$level", 0x04, $message ]);
+
+       if (!defined($result)) {
+           log_msg ("SNMP error while sending the trap $message to $target: $session->error()", LOG_ERR);
+       }
+       else {
+           log_msg ("Trap $message successfully sent to $target", LOG_INFO);
+       }
+
+       $session->close();
+   }
+}
+
+END {
+  if ($mail_report_on eq "always" ||
+	($mail_report_on eq "errors" && $errorstate == 1))
+  {
+    my $state = ($errorstate == 1) ? "unsuccessful" : "successful";
+
+    my $message = MIME::Lite->new (
+                  From    => "$mail_from",
+                  To      => "$mail_to",
+                  Subject => "$mail_subject - $action $state",
+                  Data    => "$mail_buffer"
+    );
+  
+    $message->send;
+  }
+
+  if ($snmp_report_on eq "always" || $snmp_report_on eq "errors")
+  {
+    if ($errorstate == 1)
+    {
+      snmp_update("mylvmbackup critical, see log", 2);
+    } else {
+      if ($snmp_report_on eq "always")
+      {
+        snmp_update("mylvmbackup ok", 0);
+      }
+    }
+  }
+
+  exit 1 if ($errorstate == 1);
+}
+
+# vim: ts=2 sw=2 expandtab ft=perl:

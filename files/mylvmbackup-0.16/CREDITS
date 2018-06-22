@@ -1,0 +1,66 @@
+Several people have contributed to the script since it has been released.
+See the ChangeLog for more details.
+
+Robin H. Johnson from the Gentoo project cleaned up the code and added
+several useful features, e.g. rsync backup support.
+
+Fred Blaise contributed the initial support to use an external
+configuration file and logging via syslog.
+
+Eric Bergen provided the code that performs the InnoDB recovery prior
+to performing the backup of LVM2 snapshot volumes. He also fixed the
+broken handling of default options.
+
+Kristian Köhntopp suggested the '--pidfile' option and to add the output
+of the LVM statistics for being able to better tune the snapshot size.
+
+Marc Haber provided a patch for keeping snapshots and using "none"
+as a backup type.
+
+Patrick Hahn provided an option to call external scripts/applications
+(hooks) at various stages of the backup process.
+
+Matt Lohier submitted the patch to support rsnap as a backup backend.
+
+Matthew Boehm contributed a patch to make the backup file name suffix
+configurable via a "--suffix" option and also converted the documentation
+from asciidoc to Perl POD. He also contributed a patch to improve the
+error handling in case of a failed database connection and support for using
+date/time format strings in the backupdir and mountdir path names.
+Matthew also provided patches that enabled the use hooks written as Perl
+modules.
+
+Alexander Skwar contributed a patch to support backups using different
+compression methods other than gzip for the tar backup as well as support
+for using a non-GNU tar for the archiving.
+
+"kjetilho" (https://launchpad.net/~kjetilho-ifi) contributed a patch
+to improve the robustness and error handling of the entire script.
+(Bug #298175)
+
+Tim Stoop provided a patch to enable the --keep-mount option.
+
+Baron Schwartz provided a patch to allow reading the username and
+password from ~/.my.cnf
+
+Ronald Bradford provided many helpful suggestions to improve the
+usability and robustness of the script.
+
+Ask Bjørn Hansen contributed a patch to allow targets not to have a
+timestamp (for rsync targets, for example) and a documentation fix.
+
+Ben Bonnell contributed a patch to add support for providing rsync
+options for the rsnap backend.
+
+Klaus Ethgen contributed a patch that removes the annoying LVM
+warnings about a leaked file descriptor (DBD:mysql does not add
+FD_CLOEXEC on the MySQL socket, requires DBD::mysql 4.019 and above)
+
+Alexandre Anriot contributed multiple patches:
+
+ - The mail reporting method, which sends the log output via email.
+ - The "purge" action.
+ - The "backupretention" option that allows to only keep a defined number
+   of previous backups in the backup directory.
+ - SNMP support, which provides sending SNMP traps to specified SNMP target
+   hosts to indicate success or failure of a backup run.

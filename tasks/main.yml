@@ -1,0 +1,58 @@
+---
+
+# Either use "static: no" or use variables in the include file, otherwise the include will always be used (statically included)
+#- name: "Including Debian 7 (Wheezy)"
+#  include: "Debian_7.yml"
+#  static: no
+#  when: (ansible_distribution == "Debian" and ansible_distribution_major_version == "7")
+
+# We use ansible_lsb.id instead of ansible_distribution as this adds support for 
+# UCS (Univention Corporate Server) which reports ansible_distribution=Debian and
+# ansible_lsb.id=Univention
+
+- include_tasks: "{{ ansible_system }}-{{ ansible_lsb.id }}_{{ ansible_lsb.major_release }}.yml"
+  when: ansible_lsb is defined and ansible_lsb.id is defined
+
+- include_tasks: "{{ ansible_system }}-{{ ansible_distribution }}_{{ ansible_distribution_major_version }}.yml"
+  when: ansible_lsb is not defined or ansible_lsb.id is not defined
+
+# mylvmbackup --action=purge purges all files in /var/local/backup/mysql
+# including automysqlbackup files, so use an own directory.
+- file: path=/var/local/backup/mysql/mylvmbackup state=directory group=adm mode=0750
+
+- name: "Getting mailname"
+  shell: cat /etc/mailname
+  changed_when: no
+  register: mailname
+
+- name: "Set backupdir"
+  lineinfile: dest=/etc/mylvmbackup.conf regexp='backupdir=' line='backupdir=/var/local/backup/mysql/mylvmbackup/'
+
+- name: "Set backupretention"
+  lineinfile: dest=/etc/mylvmbackup.conf regexp='backupretention=' line='backupretention=5'
+
+- name: "Set log_method"
+  lineinfile: dest=/etc/mylvmbackup.conf regexp='log_method=' line='log_method=syslog'
+
+- name: "Set mail_report_on"
+  lineinfile: dest=/etc/mylvmbackup.conf regexp='mail_report_on=' line='mail_report_on=errors'
+
+- name: "Set mail_from"
+  lineinfile: dest=/etc/mylvmbackup.conf regexp='mail_from=' line='mail_from=root@{{ mailname.stdout }}'
+
+- name: "Set mail_to"
+  lineinfile: dest=/etc/mylvmbackup.conf regexp='mail_to=' line='mail_to={{ mylvmbackup_mail_to }}'
+
+- name: "Set quiet"
+  lineinfile: dest=/etc/mylvmbackup.conf regexp='quiet=' line='quiet=0'
+
+# GRANT RELOAD, REPLICATION CLIENT ON *.* TO 'mylvmbackup'@'localhost' IDENTIFIED BY '';
+# GRANT SELECT ON mysql.* TO 'mylvmbackup'@'localhost';
+- name: Check password set in /etc/mylvmbackup.conf
+  command: egrep "password=.+" /etc/mylvmbackup.conf
+  changed_when: false
+  # when ! maria-db installed
+
+- name: Ensure cron
+  copy: src=local-mylvmbackup dest=/etc/cron.d/
+
