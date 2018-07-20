@@ -5,5 +5,5 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 
 # We use the syslog and mail option in mylvmbackup, so no need to get the output
 # Don't use the full path as on Debian 7 it is /usr/local/bin, above /usr/bin
-15 0 * * *  root    mylvmbackup --action=purge; mylvmbackup >/dev/null 2>&1
+15 0 * * *  root    mylvmbackup >/dev/null 2>&1; mylvmbackup --action=purge
 

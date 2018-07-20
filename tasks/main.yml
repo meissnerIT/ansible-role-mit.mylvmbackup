@@ -18,7 +18,8 @@
 
 # mylvmbackup --action=purge purges all files in /var/local/backup/mysql
 # including automysqlbackup files, so use an own directory.
-- file: path=/var/local/backup/mysql/mylvmbackup state=directory group=adm mode=0750
+- name: Create directory /var/local/backup/mysql/mylvmbackup
+  file: path=/var/local/backup/mysql/mylvmbackup state=directory group=adm mode=0750
 
 - name: "Getting mailname"
   shell: cat /etc/mailname
@@ -46,12 +47,13 @@
 - name: "Set quiet"
   lineinfile: dest=/etc/mylvmbackup.conf regexp='quiet=' line='quiet=0'
 
+# Either use /root/.my.cnf or create a user:
 # GRANT RELOAD, REPLICATION CLIENT ON *.* TO 'mylvmbackup'@'localhost' IDENTIFIED BY '';
 # GRANT SELECT ON mysql.* TO 'mylvmbackup'@'localhost';
-- name: Check password set in /etc/mylvmbackup.conf
-  command: egrep "password=.+" /etc/mylvmbackup.conf
-  changed_when: false
-  # when ! maria-db installed
+#- name: Check password set in /etc/mylvmbackup.conf
+#  command: egrep "password=.+" /etc/mylvmbackup.conf
+#  changed_when: false
+#  # when ! maria-db installed
 
 - name: Ensure cron
   copy: src=local-mylvmbackup dest=/etc/cron.d/
