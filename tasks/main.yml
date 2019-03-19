@@ -30,7 +30,10 @@
   lineinfile: dest=/etc/mylvmbackup.conf regexp='backupdir=' line='backupdir=/var/local/backup/mysql/mylvmbackup/'
 
 - name: "Set backupretention"
-  lineinfile: dest=/etc/mylvmbackup.conf regexp='backupretention=' line='backupretention=5'
+  lineinfile:
+    dest: /etc/mylvmbackup.conf
+    regexp: 'backupretention='
+    line: "backupretention={{ mylvmbackup_backupretention|default('5') }}"
 
 - name: "Set log_method"
   lineinfile: dest=/etc/mylvmbackup.conf regexp='log_method=' line='log_method=syslog'
