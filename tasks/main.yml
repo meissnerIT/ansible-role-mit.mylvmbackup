@@ -61,9 +61,14 @@
 - name: Ensure cron
   copy: src=local-mylvmbackup dest=/etc/cron.d/
 
+- name: Gather the package facts
+  ansible.builtin.package_facts:
+    manager: auto
+
 - name: "logcheck rules: mit-mylvmbackup"
   copy:
     #src: "{{ ansible_distribution | lower }}-{{ ansible_distribution_major_version }}-logcheck-mit-mylvmbackup"
     src: logcheck-mit-mylvmbackup
     dest: /etc/logcheck/ignore.d.server/mit-mylvmbackup
+  when: "'logcheck' in ansible_facts.packages"
 
