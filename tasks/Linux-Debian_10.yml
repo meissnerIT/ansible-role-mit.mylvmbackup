@@ -1,5 +1,8 @@
 ---
 
-- name: "Ensure mylvmbackup is installed"
-  apt: pkg=mylvmbackup state=present
+- name: Ensure required packages
+  apt:
+    name:
+    - mylvmbackup
+    - libmime-lite-perl
 
