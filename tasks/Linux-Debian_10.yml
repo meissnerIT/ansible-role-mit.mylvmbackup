@@ -1,5 +1,0 @@
----
-
-- name: "Ensure mylvmbackup is installed"
-  apt: pkg=mylvmbackup state=present
-
