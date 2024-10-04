@@ -1,13 +1,4 @@
 ---
-# Either use "static: no" or use variables in the include file, otherwise the include will always be used (statically included)
-#- name: "Including Debian 7 (Wheezy)"
-#  include: "Debian_7.yml"
-#  static: no
-#  when: (ansible_distribution == "Debian" and ansible_distribution_major_version == "7")
-
-# We use ansible_lsb.id instead of ansible_distribution as this adds support for 
-# UCS (Univention Corporate Server) which reports ansible_distribution=Debian and
-# ansible_lsb.id=Univention
 
 - ansible.builtin.include_tasks: "{{ ansible_system }}-{{ ansible_lsb.id }}_{{ ansible_lsb.major_release }}.yml"
   when: ansible_lsb is defined and ansible_lsb.id is defined
@@ -74,7 +65,8 @@
 
 - name: "Logcheck rules: mit-mylvmbackup"
   ansible.builtin.copy:
-    #src: "{{ ansible_distribution | lower }}-{{ ansible_distribution_major_version }}-logcheck-mit-mylvmbackup"
-    src: logcheck-mit-mylvmbackup
+    # logcheck-mit-mylvmbackup-Debian-12
+    src: logcheck-mit-mylvmbackup-{{ ansible_distribution  }}-{{ ansible_distribution_major_version }}
     dest: /etc/logcheck/ignore.d.server/mit-mylvmbackup
   when: "'logcheck' in ansible_facts.packages"
+
