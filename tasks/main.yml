@@ -1,74 +1,72 @@
 ---
 
-# Either use "static: no" or use variables in the include file, otherwise the include will always be used (statically included)
-#- name: "Including Debian 7 (Wheezy)"
-#  include: "Debian_7.yml"
-#  static: no
-#  when: (ansible_distribution == "Debian" and ansible_distribution_major_version == "7")
-
-# We use ansible_lsb.id instead of ansible_distribution as this adds support for 
-# UCS (Univention Corporate Server) which reports ansible_distribution=Debian and
-# ansible_lsb.id=Univention
-
-- include_tasks: "{{ ansible_system }}-{{ ansible_lsb.id }}_{{ ansible_lsb.major_release }}.yml"
+- ansible.builtin.include_tasks: "{{ ansible_system }}-{{ ansible_lsb.id }}_{{ ansible_lsb.major_release }}.yml"
   when: ansible_lsb is defined and ansible_lsb.id is defined
 
-- include_tasks: "{{ ansible_system }}-{{ ansible_distribution }}_{{ ansible_distribution_major_version }}.yml"
+- ansible.builtin.include_tasks: "{{ ansible_system }}-{{ ansible_distribution }}_{{ ansible_distribution_major_version }}.yml"
   when: ansible_lsb is not defined or ansible_lsb.id is not defined
 
 # mylvmbackup --action=purge purges all files in /var/local/backup/mysql
 # including automysqlbackup files, so use an own directory.
 - name: Create directory /var/local/backup/mysql/mylvmbackup
-  file: path=/var/local/backup/mysql/mylvmbackup state=directory group=adm mode=0750
-
-- name: "Getting mailname"
-  shell: cat /etc/mailname
-  changed_when: no
+  ansible.builtin.file:
+    path: /var/local/backup/mysql/mylvmbackup
+    state: directory
+    group: adm
+    mode: "0750"
+- name: Getting mailname
+  ansible.builtin.command: cat /etc/mailname
+  changed_when: false
   register: mailname
 
-- name: "Set backupdir"
-  lineinfile: dest=/etc/mylvmbackup.conf regexp='backupdir=' line='backupdir=/var/local/backup/mysql/mylvmbackup/'
-
-- name: "Set backupretention"
-  lineinfile:
+- name: Set backupdir
+  ansible.builtin.lineinfile:
     dest: /etc/mylvmbackup.conf
-    regexp: 'backupretention='
-    line: "backupretention={{ mylvmbackup_backupretention|default('5') }}"
+    regexp: "'backupdir='"
+    line: "'backupdir=/var/local/backup/mysql/mylvmbackup/'"
+- name: Set backupretention
+  ansible.builtin.lineinfile:
+    dest: /etc/mylvmbackup.conf
+    regexp: backupretention=
+    line: backupretention={{ mylvmbackup_backupretention | default('5') }}
 
-- name: "Set log_method"
-  lineinfile: dest=/etc/mylvmbackup.conf regexp='log_method=' line='log_method=syslog'
-
-- name: "Set mail_report_on"
-  lineinfile: dest=/etc/mylvmbackup.conf regexp='mail_report_on=' line='mail_report_on=errors'
-
-- name: "Set mail_from"
-  lineinfile: dest=/etc/mylvmbackup.conf regexp='mail_from=' line='mail_from=root@{{ mailname.stdout }}'
-
-- name: "Set mail_to"
-  lineinfile: dest=/etc/mylvmbackup.conf regexp='mail_to=' line='mail_to={{ mylvmbackup_mail_to }}'
-
-- name: "Set quiet"
-  lineinfile: dest=/etc/mylvmbackup.conf regexp='quiet=' line='quiet=0'
-
-# Either use /root/.my.cnf or create a user:
-# GRANT RELOAD, REPLICATION CLIENT ON *.* TO 'mylvmbackup'@'localhost' IDENTIFIED BY '';
-# GRANT SELECT ON mysql.* TO 'mylvmbackup'@'localhost';
-#- name: Check password set in /etc/mylvmbackup.conf
-#  command: egrep "password=.+" /etc/mylvmbackup.conf
-#  changed_when: false
-#  # when ! maria-db installed
-
+- name: Set log_method
+  ansible.builtin.lineinfile:
+    dest: /etc/mylvmbackup.conf
+    regexp: "'log_method='"
+    line: "'log_method=syslog'"
+- name: Set mail_report_on
+  ansible.builtin.lineinfile:
+    dest: /etc/mylvmbackup.conf
+    regexp: "'mail_report_on='"
+    line: "'mail_report_on=errors'"
+- name: Set mail_from
+  ansible.builtin.lineinfile:
+    dest: /etc/mylvmbackup.conf
+    regexp: "'mail_from='"
+    line: "'mail_from=root@{{ mailname.stdout }}'"
+- name: Set mail_to
+  ansible.builtin.lineinfile:
+    dest: /etc/mylvmbackup.conf
+    regexp: "'mail_to='"
+    line: "'mail_to={{ mylvmbackup_mail_to }}'"
+- name: Set quiet
+  ansible.builtin.lineinfile:
+    dest: /etc/mylvmbackup.conf
+    regexp: "'quiet='"
+    line: "'quiet=0'"
 - name: Ensure cron
-  copy: src=local-mylvmbackup dest=/etc/cron.d/
-
+  ansible.builtin.copy:
+    src: local-mylvmbackup
+    dest: /etc/cron.d/
 - name: Gather the package facts
   ansible.builtin.package_facts:
     manager: auto
 
-- name: "logcheck rules: mit-mylvmbackup"
-  copy:
-    #src: "{{ ansible_distribution | lower }}-{{ ansible_distribution_major_version }}-logcheck-mit-mylvmbackup"
-    src: logcheck-mit-mylvmbackup
+- name: "Logcheck rules: mit-mylvmbackup"
+  ansible.builtin.copy:
+    # logcheck-mit-mylvmbackup-Debian-12
+    src: logcheck-mit-mylvmbackup-{{ ansible_distribution  }}-{{ ansible_distribution_major_version }}
     dest: /etc/logcheck/ignore.d.server/mit-mylvmbackup
   when: "'logcheck' in ansible_facts.packages"
 

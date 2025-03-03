@@ -1,0 +1,5 @@
+---
+- name: Ensure mylvmbackup is installed
+  ansible.builtin.apt:
+    pkg: mylvmbackup
+    state: present
