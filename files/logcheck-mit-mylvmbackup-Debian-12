@@ -1,6 +1,8 @@
-^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ dmeventd\[[0-9]+\]: No longer monitoring snapshot vg0-mysql_snapshot\.
+^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ dmeventd\[[0-9]+\]: Monitoring snapshot .*\.
+^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ dmeventd\[[0-9]+\]: No longer monitoring snapshot .*
+^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ dmeventd\[[0-9]+\]: dmeventd ready for processing\.
 ^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ dmeventd\[[0-9]+\]: dmeventd was idle for 3600 second\(s\), exiting\.
 ^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ dmeventd\[[0-9]+\]: dmeventd shutting down\.
-^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ kernel: EXT4-fs \(dm-[0-9]+\): mounted filesystem with ordered data mode\. Quota mode: none\.
+^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ kernel: .*EXT4-fs \(dm-[0-9]+\): mounted filesystem with ordered data mode\. Quota mode: none\.
 ^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ kernel: .*EXT4-fs \(dm-[0-9]+\): unmounting filesystem\.
 ^(\w{3} [ :0-9]{11}|[0-9T:.+-]{32}) [._[:alnum:]-]+ mylvmbackup\[[0-9]+\]: .*
